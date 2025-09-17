@@ -608,6 +608,110 @@ if channel.try_send().is_err() { handle_backpressure(); }
 channel.send(request).await;  // Spam!
 ```
 
+## 7. Advanced Concurrency Patterns
+
+### Task Cancellation with CancellationToken
+
+Modern async applications need clean task cancellation. The audio system demonstrates this pattern:
+
+```rust
+// From src/audio.rs - Task cancellation pattern
+pub fn play(&self, url: String) -> Result<()> {
+    self.stop()?; // Cancel any existing tasks
+    
+    let cancellation_token = CancellationToken::new();
+    
+    // Store token for later cancellation
+    {
+        let mut state = self.state.lock()?;
+        state.cancellation_token = Some(cancellation_token.clone());
+    }
+    
+    // Spawn task with cancellation
+    tokio::spawn(async move {
+        tokio::select! {
+            result = stream_audio(url) => {
+                // Normal completion
+            }
+            _ = cancellation_token.cancelled() => {
+                debug!("Stream cancelled cleanly");
+            }
+        }
+    });
+}
+
+pub fn stop(&self) -> Result<()> {
+    let mut state = self.state.lock()?;
+    
+    // Cancel running tasks
+    if let Some(token) = state.cancellation_token.take() {
+        token.cancel(); // 🔑 All tasks receive cancellation signal
+    }
+}
+```
+
+**Benefits**:
+- **Clean Shutdown**: No orphaned tasks consuming resources
+- **Immediate Response**: `stop()` returns immediately, cancellation is async
+- **Composable**: Can cancel entire trees of related tasks
+
+### Event Broadcasting with Watch Channels
+
+For state that many components need to observe:
+
+```rust
+// Single writer, multiple readers pattern
+let (event_sender, event_receiver) = watch::channel(PlayerEvent::Stopped);
+
+// Background task sends events
+let _ = event_sender.send(PlayerEvent::StreamConnected);
+let _ = event_sender.send(PlayerEvent::BufferProgress(bytes));
+
+// UI components subscribe to events
+let mut ui_events = player.event_receiver();
+tokio::spawn(async move {
+    while ui_events.changed().await.is_ok() {
+        match *ui_events.borrow() {
+            PlayerEvent::Error(ref msg) => show_error(msg),
+            PlayerEvent::BufferProgress(bytes) => update_progress(bytes),
+            _ => {}
+        }
+    }
+});
+```
+
+**Pattern**: Use `watch::channel` for state broadcasting, `mpsc::channel` for work queues.
+
+### Backpressure Management
+
+Handling producers that are faster than consumers:
+
+```rust
+// Network fetch with backpressure handling
+while let Some(chunk) = network_stream.next().await {
+    match audio_channel.try_send(chunk) {
+        Ok(_) => {}, // Sent successfully
+        Err(TrySendError::Full(_)) => {
+            // Channel full - apply backpressure
+            debug!("Audio buffer full, slowing network");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                _ = cancellation_token.cancelled() => break,
+            }
+            // Retry with blocking send
+            audio_channel.send(chunk).await?;
+        }
+        Err(TrySendError::Closed(_)) => break, // Consumer gone
+    }
+}
+```
+
+**Strategy**: 
+1. Try non-blocking send first
+2. If full, apply small delay (backpressure)
+3. Retry with blocking send
+4. Respect cancellation throughout
+
 ## Key Takeaways
 
 1. **Separation of Concerns**: UI handles interaction, workers handle I/O
@@ -616,6 +720,10 @@ channel.send(request).await;  // Spam!
 4. **Smart Rate Limiting**: Combine business logic, time-based debouncing, and backpressure
 5. **Error Boundaries**: Wrap errors in messages, handle them in the UI layer
 6. **State Relevance**: Only apply responses that are still relevant to current UI state
+7. **Task Cancellation**: Use `CancellationToken` for clean resource cleanup
+8. **Event Broadcasting**: `watch::channel` for state updates, `mpsc::channel` for work queues
+9. **Backpressure Handling**: Slow producers when consumers can't keep up
+10. **Bounded Resources**: Always use bounded channels to prevent memory leaks
 
 ## Next Steps
 

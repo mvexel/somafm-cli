@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod audio;
+mod audio_demo;
 mod ui;
 mod actions;
 

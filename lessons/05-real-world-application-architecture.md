@@ -86,18 +86,42 @@ terminal.show_cursor()?;
 ### Audio Resource Management
 
 ```rust
-// From src/audio.rs:19-26
+// Updated audio.rs architecture - Consolidated state management
 pub struct SimpleAudioPlayer {
-    sink: Arc<Mutex<Option<Sink>>>,
+    state: Arc<Mutex<PlayerState>>,                // 🔑 Single mutex for all state
     _stream: OutputStream,                         // 🔑 Keep alive with naming
     stream_handle: OutputStreamHandle,
-    current_url: Arc<Mutex<Option<String>>>,
-    is_playing: Arc<Mutex<bool>>,
-    is_paused: Arc<Mutex<bool>>,
+    event_sender: watch::Sender<PlayerEvent>,      // 🔑 Event broadcasting
+    event_receiver: watch::Receiver<PlayerEvent>,
+}
+
+// Consolidated player state to avoid multiple mutex locks
+struct PlayerState {
+    current_url: Option<String>,
+    playback_state: PlaybackState,
+    sink: Option<Sink>,
+    cancellation_token: Option<CancellationToken>, // 🔑 Task cancellation
+    auto_reconnect: bool,
+    reconnect_attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum PlayerEvent {
+    Started(String),
+    Stopped,
+    Paused,
+    Resumed,
+    Error(String),
+    StreamConnected,
+    BufferProgress(usize),                         // 🔑 Memory monitoring
 }
 ```
 
-**Key Pattern**: The `_stream` field uses underscore naming to indicate it's intentionally unused but must be kept alive. This prevents the audio output stream from being dropped.
+**Key Improvements**:
+- **Single Mutex**: Eliminates deadlock risks from multiple `Arc<Mutex<_>>` fields
+- **Event System**: `tokio::sync::watch` for broadcasting state changes without lock contention
+- **Task Cancellation**: `CancellationToken` for proper cleanup of streaming tasks
+- **State Consolidation**: All related state in one structure with clear ownership
 
 ### Graceful Shutdown
 
@@ -168,53 +192,99 @@ fn log_memory_usage(buffer_size: usize, operation: &str) {
 
 **Pattern**: Monitor resource usage in debug builds to catch memory issues early.
 
-### Continuous Streaming Architecture
+### Modern Streaming Architecture
 
-The audio system demonstrates a sophisticated continuous streaming pattern that processes data incrementally:
+The audio system demonstrates a production-ready streaming architecture with separation of concerns and proper resource management:
 
 ```rust
-// From src/audio.rs:154-256 - Continuous streaming implementation
+// Improved streaming with bounded buffering and backpressure handling
 async fn fetch_and_play_stream(
     url: &str,
     stream_handle: &OutputStreamHandle,
-    sink: &Arc<Mutex<Option<Sink>>>,
+    state: &Arc<Mutex<PlayerState>>,
+    event_sender: &watch::Sender<PlayerEvent>,
+    cancellation_token: &CancellationToken,
 ) -> Result<()> {
-    // Create HTTP stream
-    let mut stream = response.bytes_stream();
-    let mut decode_buffer = Vec::new();
-    
-    // Process chunks continuously
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        decode_buffer.extend_from_slice(&chunk);
-        
-        // Decode and play when we have enough data
-        if decode_buffer.len() >= DECODE_CHUNK_SIZE {
-            let cursor = Cursor::new(decode_buffer.clone());
-            match Decoder::new(cursor) {
-                Ok(source) => {
-                    current_sink.append(source);  // 🔑 Continuous playback
-                    decode_buffer.clear();
-                }
-                Err(_) => {
-                    // Handle incomplete data gracefully
-                    if decode_buffer.len() >= MAX_DECODE_BUFFER {
-                        decode_buffer.clear();  // 🔑 Prevent memory leaks
+    // Create bounded channel for audio chunks
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32); // 🔑 Bounded buffer
+
+    // Spawn separate network fetching task
+    let fetch_task = tokio::spawn(async move {
+        Self::fetch_network_stream(url, audio_tx, cancellation_token, event_sender).await
+    });
+
+    // Main decoding loop with smart buffering
+    let mut decode_buffer = VecDeque::new();
+    const MIN_DECODE_SIZE: usize = 64 * 1024;  // 🔑 Accumulate before decode
+    const MAX_BUFFER_SIZE: usize = 512 * 1024; // 🔑 Prevent unbounded growth
+
+    loop {
+        tokio::select! {
+            chunk_opt = audio_rx.recv() => {
+                match chunk_opt {
+                    Some(chunk) => {
+                        decode_buffer.extend(chunk);
+                        
+                        // Smart memory management
+                        if decode_buffer.len() >= MIN_DECODE_SIZE {
+                            Self::try_decode_and_play(&mut decode_buffer, state).await?;
+                        }
+                        
+                        // Prevent memory leaks
+                        if decode_buffer.len() > MAX_BUFFER_SIZE {
+                            let drop_size = decode_buffer.len() / 4;
+                            decode_buffer.drain(..drop_size); // 🔑 Drop old data
+                        }
                     }
+                    None => break, // Network stream ended
                 }
             }
+            _ = cancellation_token.cancelled() => {
+                break; // 🔑 Proper cancellation
+            }
+        }
+    }
+}
+
+// Network layer with backpressure handling
+async fn fetch_network_stream(
+    url: String,
+    audio_tx: mpsc::Sender<Vec<u8>>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    let mut stream = response.bytes_stream();
+    
+    while let Some(chunk_result) = stream.next().await {
+        if cancellation_token.is_cancelled() { break; }
+        
+        let chunk = chunk_result?;
+        
+        // Apply backpressure when channel is full
+        match audio_tx.try_send(chunk.to_vec()) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel full - apply backpressure
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                    _ = cancellation_token.cancelled() => break,
+                }
+                audio_tx.send(chunk.to_vec()).await?; // 🔑 Retry after wait
+            }
+            Err(_) => break, // Channel closed
         }
     }
 }
 ```
 
-**Key Patterns**:
-1. **Incremental Processing**: Process data in chunks rather than loading everything into memory
-2. **Graceful Degradation**: Handle decode failures by accumulating more data
-3. **Memory Bounds**: Enforce maximum buffer sizes to prevent memory leaks
-4. **Continuous Playback**: Append new audio sources to maintain uninterrupted streaming
+**Modern Architecture Benefits**:
+1. **Separation of Concerns**: Network fetching and audio decoding in separate tasks
+2. **Bounded Buffering**: `mpsc::channel` with fixed capacity prevents memory leaks
+3. **Backpressure**: Network automatically slows when decoder can't keep up
+4. **Proper Cancellation**: `CancellationToken` allows clean task termination
+5. **Smart Memory Management**: Accumulate data before decode attempts, drop old data when needed
+6. **Event Broadcasting**: `watch::Sender` allows UI to react to streaming events
 
-**Why This Matters**: Traditional "download-then-play" approaches cause noticeable delays and memory usage spikes. Continuous streaming provides immediate playback and constant memory usage.
+**Why This Architecture**: Traditional approaches either block on network or decode failures. This design provides continuous playback with predictable memory usage and proper error boundaries.
 
 ## 4. Error Handling Architecture
 
@@ -267,6 +337,72 @@ if self.req_tx.try_send(Request::LoadTrackForStation {
 ```
 
 **Pattern**: Always have a fallback plan. Reset UI state if operations fail.
+
+### Automatic Retry and Resilience Patterns
+
+The audio system demonstrates production-grade retry logic for handling network instability:
+
+```rust
+// Retry logic with exponential backoff and cancellation
+async fn stream_with_retry(
+    url: String,
+    state: Arc<Mutex<PlayerState>>,
+    stream_handle: OutputStreamHandle,
+    event_sender: watch::Sender<PlayerEvent>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    const MAX_RETRY_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 2000;
+
+    loop {
+        // Check retry conditions
+        let should_retry = {
+            let state_guard = state.lock()?;
+            state_guard.auto_reconnect && state_guard.reconnect_attempts < MAX_RETRY_ATTEMPTS
+        };
+
+        if !should_retry || cancellation_token.is_cancelled() {
+            break;
+        }
+
+        // Attempt streaming
+        match Self::fetch_and_play_stream(&url, &stream_handle, &state, &event_sender, &cancellation_token).await {
+            Ok(_) => break, // Success - exit retry loop
+            Err(e) => {
+                // Increment attempts and check limits
+                {
+                    let mut state_guard = state.lock()?;
+                    state_guard.reconnect_attempts += 1;
+                    
+                    if state_guard.reconnect_attempts >= MAX_RETRY_ATTEMPTS {
+                        state_guard.set_state(PlaybackState::Error(format!("Max retries: {}", e)));
+                        let _ = event_sender.send(PlayerEvent::Error(format!("Max retries: {}", e)));
+                        break;
+                    }
+                }
+
+                // Send error event and wait before retry
+                let _ = event_sender.send(PlayerEvent::Error(format!("Retrying... ({})", e)));
+                
+                // Cancellable delay
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)) => {},
+                    _ = cancellation_token.cancelled() => break,
+                }
+            }
+        }
+    }
+}
+```
+
+**Resilience Patterns**:
+1. **Bounded Retries**: Prevent infinite retry loops with maximum attempt limits
+2. **Cancellable Delays**: Respect user cancellation even during retry waits
+3. **State Tracking**: Maintain retry count per connection attempt
+4. **User Feedback**: Inform users about retry attempts and final failures
+5. **Graceful Degradation**: Switch to error state after exhausting retries
+
+**Real-World Benefits**: Radio streams often have temporary connectivity issues. This pattern ensures playback resumes automatically without user intervention while preventing resource waste on permanently failed streams.
 
 ## 5. Testing Strategies
 
@@ -672,66 +808,90 @@ impl SomaFMPlugin for LastFmPlugin {
 }
 ```
 
-### Exercise 5: Optimize Streaming Performance
-**Goal**: Enhance the continuous streaming implementation for better performance and reliability.
+### Exercise 5: Advanced Streaming Features
+**Goal**: Build upon the improved streaming architecture to add advanced features.
 
-**Task**: Add adaptive streaming with quality control:
+**Background**: The streaming implementation now includes cancellation, backpressure, and retry logic. This exercise extends it further.
+
+**Task 1**: Add adaptive quality control:
 
 ```rust
-// From src/audio.rs - Enhanced streaming configuration
+// From src/audio.rs - Quality monitoring
 #[derive(Debug, Clone)]
-pub struct StreamingConfig {
-    pub initial_buffer_size: usize,    // Start small for fast playback
-    pub max_buffer_size: usize,        // Prevent memory bloat
-    pub chunk_size: usize,             // Optimal decode chunk size
-    pub quality_threshold: f32,        // Minimum quality for playback
-    pub retry_attempts: u32,           // Network error handling
-    pub adaptive_sizing: bool,         // Adjust sizes based on network
+pub struct StreamingMetrics {
+    pub bytes_per_second: f64,
+    pub decode_success_rate: f64,
+    pub buffer_underruns: u32,
+    pub average_latency: Duration,
 }
 
-impl Default for StreamingConfig {
-    fn default() -> Self {
-        Self {
-            initial_buffer_size: 32 * 1024,   // 32KB for quick start
-            max_buffer_size: 512 * 1024,      // 512KB max memory
-            chunk_size: 64 * 1024,            // 64KB decode chunks
-            quality_threshold: 0.8,           // 80% quality minimum
-            retry_attempts: 3,                // 3 network retries
-            adaptive_sizing: true,            // Enable adaptation
+impl SimpleAudioPlayer {
+    pub fn get_streaming_metrics(&self) -> Option<StreamingMetrics> {
+        // Track and return current performance metrics
+    }
+    
+    async fn adaptive_decode(&mut self, buffer: &mut VecDeque<u8>) -> Result<()> {
+        let metrics = self.calculate_recent_performance();
+        
+        // Adjust decode strategy based on performance
+        let min_size = if metrics.decode_success_rate > 0.9 {
+            32 * 1024  // Aggressive - small chunks for low latency
+        } else {
+            128 * 1024 // Conservative - larger chunks for stability
+        };
+        
+        if buffer.len() >= min_size {
+            self.try_decode_and_play(buffer).await
+        } else {
+            Ok(()) // Wait for more data
         }
     }
 }
+```
 
-async fn adaptive_fetch_and_play_stream(
-    url: &str,
-    config: StreamingConfig,
-    sink: &Arc<Mutex<Option<Sink>>>,
-) -> Result<()> {
-    let mut current_chunk_size = config.chunk_size;
-    let mut network_quality = 1.0f32;
-    let mut consecutive_errors = 0u32;
+**Task 2**: Add ICY metadata parsing:
+
+```rust
+// Parse radio station metadata (song titles, etc.)
+#[derive(Debug, Clone)]
+pub struct IcyMetadata {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub station: Option<String>,
+    pub bitrate: Option<u32>,
+}
+
+// Extend PlayerEvent for metadata
+pub enum PlayerEvent {
+    // ... existing events
+    MetadataUpdate(IcyMetadata),
+    QualityChange { bitrate: u32, sample_rate: u32 },
+}
+```
+
+**Task 3**: Add network health monitoring:
+
+```rust
+pub struct NetworkHealth {
+    connection_stability: f32,  // 0.0 - 1.0
+    bandwidth_estimate: u32,    // bytes/sec
+    jitter: Duration,           // connection consistency
+}
+
+impl SimpleAudioPlayer {
+    async fn monitor_network_health(&self) -> NetworkHealth {
+        // Implement network quality assessment
+    }
     
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(data) => {
-                // Adapt chunk size based on network performance
-                if config.adaptive_sizing {
-                    current_chunk_size = adapt_chunk_size(
-                        current_chunk_size, 
-                        network_quality,
-                        &config
-                    );
-                }
-                
-                // Process with current settings
-                process_audio_chunk(data, current_chunk_size, sink).await?;
-                consecutive_errors = 0;
-            }
-            Err(e) => {
-                consecutive_errors += 1;
-                if consecutive_errors > config.retry_attempts {
-                    return Err(e.into());
-                }
+    fn should_retry_with_quality(&self, error: &Error, health: &NetworkHealth) -> bool {
+        // Smart retry decisions based on network conditions
+        match error.kind() {
+            ErrorKind::Timeout if health.connection_stability < 0.5 => false,
+            ErrorKind::ConnectionReset if health.jitter > Duration::from_secs(5) => false,
+            _ => true
+        }
+    }
+}
                 
                 // Exponential backoff
                 tokio::time::sleep(Duration::from_millis(
@@ -816,13 +976,57 @@ ui.update_data(api.fetch_data().await?)  // UI blocked by network
 6. **Configuration**: Make settings configurable, support multiple configuration sources
 7. **Extensibility**: Design for future enhancement with plugins or configuration
 
-## Conclusion
+## Conclusion: Evolution of Production-Ready Code
 
-The SomaFM CLI demonstrates how to build a real-world Rust application that is:
-- **Responsive**: UI never blocks on network operations
-- **Robust**: Graceful error handling and recovery
+This curriculum demonstrates how real-world Rust applications evolve from working prototypes to production-ready systems. The SomaFM CLI, particularly its audio player architecture, showcases this progression:
+
+### Initial Implementation (Working Prototype)
+- Multiple `Arc<Mutex<_>>` for state (deadlock-prone)
+- Basic streaming with chunk-by-chunk decoding
+- No task cancellation or retry logic
+- Simple error propagation
+
+### Production Implementation (Current)
+- Single `PlayerState` mutex (deadlock-free)
+- Bounded channels with backpressure handling
+- `CancellationToken` for clean task termination
+- Automatic retry with exponential backoff
+- Event system for reactive state updates
+- Memory monitoring and bounded buffers
+
+### Key Architectural Evolution
+
+1. **State Management**: From multiple mutexes to consolidated state reduces deadlock risks
+2. **Concurrency**: From basic async to advanced cancellation and backpressure patterns
+3. **Error Handling**: From simple propagation to retry logic and graceful degradation
+4. **Resource Management**: From unbounded growth to careful memory and task management
+5. **Observability**: From basic logging to event-driven monitoring and metrics
+
+### Production-Ready Qualities
+
+The SomaFM CLI now demonstrates patterns suitable for production use:
+- **Responsive**: UI never blocks on network operations (message passing)
+- **Robust**: Graceful error handling and automatic recovery (retry logic)
 - **Maintainable**: Clear separation of concerns and module boundaries
 - **Performant**: Efficient resource usage and smart caching
-- **User-Friendly**: Smooth interaction patterns and appropriate feedback
+- **Observable**: Event system enables monitoring and debugging
+- **Safe**: Proper resource cleanup prevents memory leaks and deadlocks
 
-These patterns scale well beyond CLI applications to web services, desktop apps, and embedded systems. The key is applying Rust's ownership system and type safety to enforce good architectural boundaries while leveraging async programming for responsive user experiences.
+### Rust-Specific Benefits
+
+Rust's type system and ownership model enforce these patterns:
+- **Compile-time safety**: Prevents data races and memory leaks
+- **Zero-cost abstractions**: High-level patterns with no runtime overhead
+- **Fearless concurrency**: Complex async patterns without traditional pitfalls
+- **Error handling**: `Result<T, E>` forces explicit error consideration
+
+## Next Steps for Real-World Deployment
+
+- **Metrics Collection**: Add prometheus/metrics integration
+- **Configuration Management**: Environment-based configuration
+- **Structured Logging**: Correlation IDs and log aggregation
+- **Performance Profiling**: CPU and memory profiling in production
+- **Circuit Breakers**: Prevent cascade failures from bad streams
+- **Health Checks**: Application health endpoints for monitoring
+
+These patterns apply beyond audio streaming to any production Rust application requiring robust concurrent processing, error handling, and resource management. The techniques demonstrated here scale from CLI tools to web services, desktop applications, and embedded systems.

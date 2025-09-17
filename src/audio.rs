@@ -5,6 +5,17 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use futures_util::stream::StreamExt;
 
+/// Helper function to log memory usage for monitoring
+fn log_memory_usage(buffer_size: usize, operation: &str) {
+    let kb = buffer_size as f64 / 1024.0;
+    let mb = kb / 1024.0;
+    if mb >= 1.0 {
+        debug!("{}: Using {:.1} MB ({:.0} KB) of memory", operation, mb, kb);
+    } else {
+        debug!("{}: Using {:.0} KB of memory", operation, kb);
+    }
+}
+
 pub struct SimpleAudioPlayer {
     sink: Arc<Mutex<Option<Sink>>>,
     _stream: OutputStream,
@@ -34,48 +45,37 @@ impl SimpleAudioPlayer {
         // Stop any current playback
         self.stop()?;
 
-        // Create new sink
-        let sink = Sink::try_new(&self.stream_handle)?;
-
         // Spawn a background task to fetch and play the stream
-        let sink_clone = Arc::new(Mutex::new(Some(sink)));
         let url_clone = url.clone();
         let is_playing = self.is_playing.clone();
         let is_paused = self.is_paused.clone();
         let sink_ref = self.sink.clone();
+        let stream_handle = self.stream_handle.clone();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                // First resolve the stream URL if it's a playlist
-                let actual_url = match resolve_stream_url(&url_clone).await {
-                    Ok(resolved_url) => resolved_url,
-                    Err(e) => {
-                        warn!("Failed to resolve stream URL: {}. Using original URL.", e);
-                        url_clone.clone()
-                    }
-                };
+        // Use tokio::spawn instead of creating a new runtime
+        tokio::spawn(async move {
+            // First resolve the stream URL if it's a playlist
+            let actual_url = match resolve_stream_url(&url_clone).await {
+                Ok(resolved_url) => resolved_url,
+                Err(e) => {
+                    warn!("Failed to resolve stream URL: {}. Using original URL.", e);
+                    url_clone.clone()
+                }
+            };
 
-                match fetch_and_play_stream(&actual_url, &sink_clone).await {
-                    Ok(_) => {
-                        if let Ok(mut playing) = is_playing.lock() {
-                            *playing = true;
-                        }
-                        if let Ok(mut paused) = is_paused.lock() {
-                            *paused = false;
-                        }
-                        // Move sink to main storage
-                        if let Ok(mut sink_guard) = sink_clone.lock() {
-                            if let Ok(mut main_sink) = sink_ref.lock() {
-                                *main_sink = sink_guard.take();
-                            }
-                        }
+            match fetch_and_play_stream(&actual_url, &stream_handle, &sink_ref).await {
+                Ok(_) => {
+                    if let Ok(mut playing) = is_playing.lock() {
+                        *playing = true;
                     }
-                    Err(e) => {
-                        warn!("Failed to fetch and play stream: {}", e);
+                    if let Ok(mut paused) = is_paused.lock() {
+                        *paused = false;
                     }
                 }
-            });
+                Err(e) => {
+                    warn!("Failed to fetch and play stream: {}", e);
+                }
+            }
         });
 
         // Update state immediately
@@ -148,11 +148,15 @@ impl SimpleAudioPlayer {
 
 async fn fetch_and_play_stream(
     url: &str,
+    stream_handle: &OutputStreamHandle,
     sink: &Arc<Mutex<Option<Sink>>>,
 ) -> Result<()> {
     debug!("Fetching stream from URL: {}", url);
 
-    // Download a much larger buffer for continuous playback (5MB)
+    // Create sink for this stream
+    let new_sink = Sink::try_new(stream_handle)?;
+
+    // Download a smaller initial buffer for faster playback start
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
@@ -163,46 +167,56 @@ async fn fetch_and_play_stream(
         return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
     }
 
-    // Get a large chunk to ensure continuous playback
+    // Get initial chunk for faster playback start
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
 
-    // Collect enough chunks for several minutes of audio
+    // Use much smaller buffer for memory efficiency (256KB instead of 5MB)
     let mut chunks_collected = 0;
-    const MAX_INITIAL_CHUNKS: usize = 200; // Much larger for continuous streaming
-    const MAX_BUFFER_SIZE: usize = 5 * 1024 * 1024; // 5MB
+    const MAX_INITIAL_CHUNKS: usize = 50; // Reduced for faster start
+    const MAX_BUFFER_SIZE: usize = 256 * 1024; // 256KB instead of 5MB
+    const MIN_BUFFER_SIZE: usize = 64 * 1024; // 64KB minimum for reliable decoding
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buffer.extend_from_slice(&chunk);
         chunks_collected += 1;
 
-        // Break when we have enough data for continuous playback
-        if chunks_collected >= MAX_INITIAL_CHUNKS || buffer.len() > MAX_BUFFER_SIZE {
+        // Break when we have enough data for initial playback
+        if buffer.len() >= MIN_BUFFER_SIZE &&
+           (chunks_collected >= MAX_INITIAL_CHUNKS || buffer.len() >= MAX_BUFFER_SIZE) {
             break;
         }
     }
 
     let buffer_len = buffer.len();
-    debug!("Received {} bytes from stream for decoding", buffer_len);
+    log_memory_usage(buffer_len, "Audio buffer allocation");
+    debug!("Received {} bytes ({:.1} KB) from stream for decoding",
+           buffer_len, buffer_len as f64 / 1024.0);
 
     if buffer.is_empty() {
         return Err(anyhow::anyhow!("No data received from stream"));
     }
 
-    // Create a decoder from the large buffer
+    if buffer_len < MIN_BUFFER_SIZE {
+        warn!("Buffer size {} bytes is below minimum {} bytes, audio may not play reliably",
+              buffer_len, MIN_BUFFER_SIZE);
+    }
+
+    // Create a decoder from the buffer
     let cursor = Cursor::new(buffer);
 
     match Decoder::new(cursor) {
         Ok(source) => {
             debug!("Successfully decoded audio source");
             // Add source to sink and play
-            if let Ok(sink_guard) = sink.lock() {
-                if let Some(sink) = sink_guard.as_ref() {
-                    sink.append(source);
-                    sink.play();
-                    debug!("Audio source added to sink and playing");
-                }
+            new_sink.append(source);
+            new_sink.play();
+            debug!("Audio source added to sink and playing");
+
+            // Store the sink in the shared storage
+            if let Ok(mut sink_guard) = sink.lock() {
+                *sink_guard = Some(new_sink);
             }
         }
         Err(e) => {

@@ -2,7 +2,6 @@ mod api;
 mod app;
 mod audio;
 mod ui;
-mod utils;
 
 use anyhow::Result;
 use app::AppController;

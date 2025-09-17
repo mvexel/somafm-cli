@@ -6,17 +6,42 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::Instant;
 
-pub struct App {
+// Layout constants for better maintainability
+const HEADER_HEIGHT: u16 = 5;
+const FOOTER_HEIGHT: u16 = 3;
+const STATUS_HEIGHT: u16 = 3;
+const MARGIN: u16 = 1;
+
+// Station list layout constants
+const HIGHLIGHT_WIDTH: usize = 3; // width of highlight symbol " > "
+const LISTENERS_WIDTH: usize = 6; // " 1339 "
+const SEPARATORS_WIDTH: usize = 6; // " │ " * 2 separators
+const MIN_GENRE_WIDTH: usize = 8;
+const MIN_DESCRIPTION_WIDTH: usize = 20;
+const MIN_STATION_WIDTH: usize = 15;
+
+pub struct UIState {
     pub stations: Vec<Station>,
     pub current_station_index: usize,
     pub audio_player: SimpleAudioPlayer,
     pub list_state: ListState,
     pub should_quit: bool,
     pub current_track: Option<Track>,
+    pub currently_playing_station_id: Option<String>,
+    // Status and loading flags
+    pub status_message: String,
+    pub is_fetching_stations: bool,
+    pub is_fetching_track: bool,
+    // Cache for rendered station items to improve performance
+    station_items_cache: Option<Vec<String>>,
+    last_area_width: u16,
 }
 
-impl App {
+impl UIState {
     pub fn new(audio_player: SimpleAudioPlayer) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
@@ -28,6 +53,12 @@ impl App {
             list_state,
             should_quit: false,
             current_track: None,
+            currently_playing_station_id: None,
+            status_message: String::new(),
+            is_fetching_stations: false,
+            is_fetching_track: false,
+            station_items_cache: None,
+            last_area_width: 0,
         }
     }
 
@@ -39,6 +70,7 @@ impl App {
         if index < self.stations.len() {
             self.current_station_index = index;
             self.list_state.select(Some(index));
+            // Do NOT invalidate cache on selection change; selection is rendered via highlight
         }
     }
 
@@ -63,31 +95,41 @@ impl App {
     pub fn quit(&mut self) {
         let _ = self.audio_player.stop();
         self.should_quit = true;
+        self.currently_playing_station_id = None;
+    }
+
+    /// Invalidate the station items cache when stations data changes
+    pub fn invalidate_station_cache(&mut self) {
+        self.station_items_cache = None;
     }
 }
 
-pub fn render_ui(f: &mut Frame, app: &App) {
+pub fn render_ui(f: &mut Frame, app: &mut UIState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .margin(1)
+        .margin(MARGIN)
         .constraints([
-            Constraint::Length(5),  // Header with station info
-            Constraint::Min(10),    // Main station browser
-            Constraint::Length(3),  // Footer
+            Constraint::Length(HEADER_HEIGHT),  // Header with station info
+            Constraint::Min(10),                // Main station browser
+            Constraint::Length(STATUS_HEIGHT),  // Status bar
+            Constraint::Length(FOOTER_HEIGHT),  // Footer
         ])
         .split(f.area());
 
     // Header with current station info
-    render_header_with_current_station(f, chunks[0], app);
+    render_header_with_current_station(f, chunks[0], &*app);
 
     // Main station browser (full width)
     render_station_list(f, chunks[1], app);
 
+    // Status bar
+    render_status(f, chunks[2], app);
+
     // Footer
-    render_footer(f, chunks[2]);
+    render_footer(f, chunks[3]);
 }
 
-fn render_header_with_current_station(f: &mut Frame, area: Rect, app: &App) {
+fn render_header_with_current_station(f: &mut Frame, area: Rect, app: &UIState) {
     let content = if let Some(station) = app.current_station() {
         let status = if app.audio_player.is_playing() {
             "PLAYING"
@@ -163,65 +205,30 @@ fn render_header_with_current_station(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(header, area);
 }
 
-fn render_station_list(f: &mut Frame, area: Rect, app: &App) {
-    // Calculate dynamic column widths based on available space
-    let available_width = area.width.saturating_sub(4) as usize; // Account for borders and padding
-    let prefix_width = 4; // " > " or "   "
-    let listeners_width = 6; // " 1339 "
-    let separators_width = 6; // " │ " * 2 separators
-    let min_genre_width = 8;
-    let min_description_width = 20;
+fn render_station_list(f: &mut Frame, area: Rect, app: &mut UIState) {
+    // Regenerate cache if width changed or cache is empty
+    if app.last_area_width != area.width || app.station_items_cache.is_none() {
+        app.last_area_width = area.width;
+        let new_rows = create_station_rows(app, area.width);
+        app.station_items_cache = Some(new_rows);
+    }
 
-    // Calculate remaining width for dynamic columns
-    let fixed_width = prefix_width + listeners_width + separators_width + min_genre_width + min_description_width;
-    let remaining_width = available_width.saturating_sub(fixed_width);
+    // We can safely unwrap here because the logic above ensures the cache is populated.
+    let cached_rows = app.station_items_cache.as_ref().unwrap();
 
-    // Distribute remaining width: 30% to station name, 20% to genre, 50% to description
-    let station_width = (remaining_width * 3 / 10).max(15);
-    let genre_width = min_genre_width + (remaining_width * 2 / 10);
-    let description_width = min_description_width + (remaining_width * 5 / 10);
-
+    // Build ListItems that borrow from cached strings and subtly highlight the currently playing row
+    let playing_id = app.currently_playing_station_id.as_deref();
     let items: Vec<ListItem> = app
         .stations
         .iter()
-        .enumerate()
-        .map(|(i, station)| {
-            let is_selected = i == app.current_station_index;
-
-            // Create the station display with enhanced formatting
-            let style = if is_selected {
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        .zip(cached_rows.iter())
+        .map(|(station, row)| {
+            let item = ListItem::new(row.as_str());
+            if Some(station.id.as_str()) == playing_id {
+                item.style(Style::default().fg(Color::Green).add_modifier(Modifier::DIM))
             } else {
-                Style::default().fg(Color::White)
-            };
-
-            let genre = station.genre.join(", ");
-            let genre_display = if genre.is_empty() { "Various" } else { &genre };
-
-            // Enhanced display format with dynamic widths
-            let content = if is_selected {
-                format!(
-                    " > {:<width1$} │ {:>5} │ {:<width2$} │ {} ",
-                    truncate_string(&station.title, station_width),
-                    format!("{}", station.listeners),
-                    truncate_string(genre_display, genre_width),
-                    truncate_string(&station.description, description_width),
-                    width1 = station_width,
-                    width2 = genre_width
-                )
-            } else {
-                format!(
-                    "   {:<width1$} │ {:>5} │ {:<width2$} │ {} ",
-                    truncate_string(&station.title, station_width),
-                    format!("{}", station.listeners),
-                    truncate_string(genre_display, genre_width),
-                    truncate_string(&station.description, description_width),
-                    width1 = station_width,
-                    width2 = genre_width
-                )
-            };
-
-            ListItem::new(content).style(style)
+                item
+            }
         })
         .collect();
 
@@ -237,17 +244,50 @@ fn render_station_list(f: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
-        );
+        )
+        .highlight_symbol(" > ");
 
-    f.render_stateful_widget(list, area, &mut app.list_state.clone());
+    f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        format!("{:<width$}", s, width = max_len)
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+fn create_station_rows(app: &UIState, area_width: u16) -> Vec<String> {
+    let now = Instant::now();
+    // Calculate dynamic column widths based on available space
+    // Subtract borders/padding (~4) and highlight column width reserved by List
+    let available_width = area_width
+        .saturating_sub(4)
+        .saturating_sub(HIGHLIGHT_WIDTH as u16) as usize; // Account for borders, padding, and highlight column
+    let fixed_width = LISTENERS_WIDTH + SEPARATORS_WIDTH + MIN_GENRE_WIDTH + MIN_DESCRIPTION_WIDTH;
+    let remaining_width = available_width.saturating_sub(fixed_width);
+
+    // Distribute remaining width: 30% to station name, 20% to genre, 50% to description
+    let station_width = (remaining_width * 3 / 10).max(MIN_STATION_WIDTH);
+    let genre_width = MIN_GENRE_WIDTH + (remaining_width * 2 / 10);
+    let description_width = MIN_DESCRIPTION_WIDTH + (remaining_width * 5 / 10);
+
+    let rows: Vec<String> = app.stations
+        .iter()
+        .map(|station| {
+            let genre = station.genre.join(", ");
+            let genre_display = if genre.is_empty() { "Various" } else { &genre };
+
+            // Enhanced display format with dynamic widths (selection handled via List highlight)
+            format!(
+                "{:<width1$} │ {:>5} │ {:<width2$} │ {} ",
+                truncate_string(&station.title, station_width),
+                format!("{}", station.listeners),
+                truncate_string(genre_display, genre_width),
+                truncate_string(&station.description, description_width),
+                width1 = station_width,
+                width2 = genre_width
+            )
+        })
+        .collect();
+    
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("debug.log") {
+        let _ = writeln!(file, "create_station_rows took: {:.2?}", now.elapsed());
     }
+    rows
 }
 
 fn render_footer(f: &mut Frame, area: Rect) {
@@ -276,4 +316,72 @@ fn render_footer(f: &mut Frame, area: Rect) {
         );
 
     f.render_widget(controls, area);
+}
+
+fn render_status(f: &mut Frame, area: Rect, app: &UIState) {
+    // Determine status text priority (owned String)
+    let text = if app.is_fetching_stations {
+        "Fetching stations…".to_string()
+    } else if app.is_fetching_track {
+        "Fetching track…".to_string()
+    } else if app.audio_player.is_playing() {
+        match &app.current_track {
+            Some(track) if !track.artist.is_empty() || !track.title.is_empty() => {
+                let info = if track.artist.is_empty() {
+                    track.title.clone()
+                } else if track.title.is_empty() {
+                    track.artist.clone()
+                } else {
+                    format!("{} - {}", track.artist, track.title)
+                };
+                format!("♪ {}", info)
+            }
+            _ => String::from("Loading track info…"),
+        }
+    } else if !app.status_message.is_empty() {
+        app.status_message.clone()
+    } else {
+        String::new()
+    };
+
+    let status = Paragraph::new(Text::from(Line::from(vec![
+        Span::styled(text, Style::default().fg(Color::White)),
+    ])))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue))
+            .title("Status"),
+    );
+
+    f.render_widget(status, area);
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    // Char-aware truncation to avoid breaking UTF-8 boundaries
+    let mut result = String::with_capacity(max_len);
+    let mut count = 0usize;
+    for ch in s.chars() {
+        let ch_len = 1; // approximate width; for simplicity treat each char as width 1
+        if count + ch_len > max_len {
+            break;
+        }
+        result.push(ch);
+        count += ch_len;
+    }
+
+    if result.chars().count() < s.chars().count() {
+        // Ensure space for ellipsis if truncated
+        let ellipsis = "...";
+        let mut trimmed = String::new();
+        let mut used = 0usize;
+        for ch in result.chars() {
+            if used + 3 > max_len { break; }
+            trimmed.push(ch);
+            used += 1;
+        }
+        format!("{:<width$}", format!("{}{}", trimmed, ellipsis), width = max_len)
+    } else {
+        format!("{:<width$}", result, width = max_len)
+    }
 }

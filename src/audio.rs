@@ -380,7 +380,7 @@ impl SimpleAudioPlayer {
         // Main decoding and playback loop
         let mut decode_buffer = VecDeque::new();
         let mut total_bytes = 0usize;
-        const MIN_DECODE_SIZE: usize = 64 * 1024; // 64KB minimum before attempting decode
+        const MIN_DECODE_SIZE: usize = 128 * 1024; // 128KB minimum before attempting decode (increased to reduce frequent decodes)
         const MAX_BUFFER_SIZE: usize = 512 * 1024; // 512KB maximum buffer
 
         loop {
@@ -395,10 +395,17 @@ impl SimpleAudioPlayer {
                             log_memory_usage(decode_buffer.len(), "Audio buffer");
                             let _ = event_sender.send(PlayerEvent::BufferProgress(decode_buffer.len()));
 
-                            // Try to decode when we have enough data
+                            // Try to decode when we have enough data and less frequently
                             if decode_buffer.len() >= MIN_DECODE_SIZE {
-                                if let Err(e) = Self::try_decode_and_play(&mut decode_buffer, state).await {
-                                    debug!("Decode attempt failed: {}", e);
+                                // Only attempt decode every few chunks to reduce overhead
+                                static mut DECODE_COUNTER: u32 = 0;
+                                unsafe {
+                                    DECODE_COUNTER += 1;
+                                    if DECODE_COUNTER % 5 == 0 { // Decode every 5th chunk
+                                        if let Err(e) = Self::try_decode_and_play(&mut decode_buffer, state).await {
+                                            debug!("Decode attempt failed: {}", e);
+                                        }
+                                    }
                                 }
                             }
 
@@ -470,7 +477,7 @@ impl SimpleAudioPlayer {
                     // Successfully sent
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Channel is full, apply backpressure by waiting a bit
+                    // Channel is full, apply backpressure by waiting a shorter time
                     debug!("Audio buffer full, applying backpressure");
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
@@ -510,19 +517,19 @@ impl SimpleAudioPlayer {
         match Decoder::new(cursor) {
             Ok(source) => {
                 debug!("Successfully decoded {} bytes", decode_buffer.len());
-                
+
                 // Add to sink
                 if let Ok(state_guard) = state.lock() {
                     if let Some(sink) = state_guard.sink.as_ref() {
                         sink.append(source);
-                        
+
                         // Start playback if not already playing
                         if !sink.is_paused() {
                             sink.play();
                         }
                     }
                 }
-                
+
                 // Clear the buffer after successful decode
                 decode_buffer.clear();
                 Ok(())

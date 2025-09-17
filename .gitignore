@@ -1,0 +1,7 @@
+/target
+GEMINI.md
+.claude/
+test*.*
+debug*.*
+*.log
+.DS_Store

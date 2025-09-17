@@ -156,9 +156,14 @@ async fn fetch_and_play_stream(
     // Create sink for this stream
     let new_sink = Sink::try_new(stream_handle)?;
 
-    // Download a smaller initial buffer for faster playback start
+    // Store the sink in the shared storage first
+    if let Ok(mut sink_guard) = sink.lock() {
+        *sink_guard = Some(new_sink);
+    }
+
+    // Create HTTP client with proper settings for streaming
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
     let response = client.get(url).send().await?;
@@ -167,64 +172,88 @@ async fn fetch_and_play_stream(
         return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
     }
 
-    // Get initial chunk for faster playback start
+    debug!("Connected to stream, starting continuous playback");
+    
+    // Get the sink reference for continuous streaming
+    let sink_clone = sink.clone();
+    
+    // Create a streaming source that reads directly from the HTTP stream
     let mut stream = response.bytes_stream();
-    let mut buffer = Vec::new();
-
-    // Use much smaller buffer for memory efficiency (256KB instead of 5MB)
-    let mut chunks_collected = 0;
-    const MAX_INITIAL_CHUNKS: usize = 50; // Reduced for faster start
-    const MAX_BUFFER_SIZE: usize = 256 * 1024; // 256KB instead of 5MB
-    const MIN_BUFFER_SIZE: usize = 64 * 1024; // 64KB minimum for reliable decoding
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.extend_from_slice(&chunk);
-        chunks_collected += 1;
-
-        // Break when we have enough data for initial playback
-        if buffer.len() >= MIN_BUFFER_SIZE &&
-           (chunks_collected >= MAX_INITIAL_CHUNKS || buffer.len() >= MAX_BUFFER_SIZE) {
-            break;
-        }
-    }
-
-    let buffer_len = buffer.len();
-    log_memory_usage(buffer_len, "Audio buffer allocation");
-    debug!("Received {} bytes ({:.1} KB) from stream for decoding",
-           buffer_len, buffer_len as f64 / 1024.0);
-
-    if buffer.is_empty() {
-        return Err(anyhow::anyhow!("No data received from stream"));
-    }
-
-    if buffer_len < MIN_BUFFER_SIZE {
-        warn!("Buffer size {} bytes is below minimum {} bytes, audio may not play reliably",
-              buffer_len, MIN_BUFFER_SIZE);
-    }
-
-    // Create a decoder from the buffer
-    let cursor = Cursor::new(buffer);
-
-    match Decoder::new(cursor) {
-        Ok(source) => {
-            debug!("Successfully decoded audio source");
-            // Add source to sink and play
-            new_sink.append(source);
-            new_sink.play();
-            debug!("Audio source added to sink and playing");
-
-            // Store the sink in the shared storage
-            if let Ok(mut sink_guard) = sink.lock() {
-                *sink_guard = Some(new_sink);
+    let mut total_bytes = 0usize;
+    
+    // Buffer for accumulating chunks before decoding
+    let mut decode_buffer = Vec::new();
+    const DECODE_CHUNK_SIZE: usize = 32 * 1024; // 32KB chunks for decoding
+    const MAX_DECODE_BUFFER: usize = 256 * 1024; // 256KB max buffer
+    
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result?;
+        total_bytes += chunk.len();
+        decode_buffer.extend_from_slice(&chunk);
+        
+        // When we have enough data, try to decode and play it
+        if decode_buffer.len() >= DECODE_CHUNK_SIZE {
+            // Check if sink is still available and get a reference to it
+            let sink_available = {
+                if let Ok(sink_guard) = sink_clone.lock() {
+                    sink_guard.is_some()
+                } else {
+                    false
+                }
+            };
+            
+            if sink_available {
+                // Only decode if sink is still alive
+                if decode_buffer.len() >= MAX_DECODE_BUFFER || total_bytes < DECODE_CHUNK_SIZE * 2 {
+                    // Try to decode this chunk
+                    let cursor = Cursor::new(decode_buffer.clone());
+                    
+                    match Decoder::new(cursor) {
+                        Ok(source) => {
+                            debug!("Decoded {} bytes, adding to sink (total: {} KB)", 
+                                   decode_buffer.len(), total_bytes / 1024);
+                            
+                            // Add to sink safely
+                            if let Ok(sink_guard) = sink_clone.lock() {
+                                if let Some(current_sink) = sink_guard.as_ref() {
+                                    current_sink.append(source);
+                                    
+                                    // Start playback if this is the first chunk
+                                    if total_bytes < DECODE_CHUNK_SIZE * 3 {
+                                        current_sink.play();
+                                        debug!("Started audio playback");
+                                    }
+                                }
+                            }
+                            
+                            // Clear the buffer after successful decode
+                            decode_buffer.clear();
+                        }
+                        Err(_) => {
+                            // If decode fails, it might be incomplete data
+                            // Keep accumulating unless buffer is too large
+                            if decode_buffer.len() >= MAX_DECODE_BUFFER {
+                                warn!("Decode buffer too large ({} bytes), discarding and continuing", 
+                                      decode_buffer.len());
+                                decode_buffer.clear();
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Sink was dropped, stop streaming
+                debug!("Sink was dropped, stopping stream");
+                break;
             }
         }
-        Err(e) => {
-            warn!("Failed to decode audio stream: {} (received {} bytes)", e, buffer_len);
-            return Err(e.into());
+        
+        // Log progress periodically
+        if total_bytes % (512 * 1024) == 0 && total_bytes > 0 {
+            debug!("Streamed {} KB so far", total_bytes / 1024);
         }
     }
 
+    debug!("Stream ended, total bytes received: {} KB", total_bytes / 1024);
     Ok(())
 }
 

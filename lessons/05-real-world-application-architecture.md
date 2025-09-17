@@ -168,6 +168,54 @@ fn log_memory_usage(buffer_size: usize, operation: &str) {
 
 **Pattern**: Monitor resource usage in debug builds to catch memory issues early.
 
+### Continuous Streaming Architecture
+
+The audio system demonstrates a sophisticated continuous streaming pattern that processes data incrementally:
+
+```rust
+// From src/audio.rs:154-256 - Continuous streaming implementation
+async fn fetch_and_play_stream(
+    url: &str,
+    stream_handle: &OutputStreamHandle,
+    sink: &Arc<Mutex<Option<Sink>>>,
+) -> Result<()> {
+    // Create HTTP stream
+    let mut stream = response.bytes_stream();
+    let mut decode_buffer = Vec::new();
+    
+    // Process chunks continuously
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result?;
+        decode_buffer.extend_from_slice(&chunk);
+        
+        // Decode and play when we have enough data
+        if decode_buffer.len() >= DECODE_CHUNK_SIZE {
+            let cursor = Cursor::new(decode_buffer.clone());
+            match Decoder::new(cursor) {
+                Ok(source) => {
+                    current_sink.append(source);  // 🔑 Continuous playback
+                    decode_buffer.clear();
+                }
+                Err(_) => {
+                    // Handle incomplete data gracefully
+                    if decode_buffer.len() >= MAX_DECODE_BUFFER {
+                        decode_buffer.clear();  // 🔑 Prevent memory leaks
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+**Key Patterns**:
+1. **Incremental Processing**: Process data in chunks rather than loading everything into memory
+2. **Graceful Degradation**: Handle decode failures by accumulating more data
+3. **Memory Bounds**: Enforce maximum buffer sizes to prevent memory leaks
+4. **Continuous Playback**: Append new audio sources to maintain uninterrupted streaming
+
+**Why This Matters**: Traditional "download-then-play" approaches cause noticeable delays and memory usage spikes. Continuous streaming provides immediate playback and constant memory usage.
+
 ## 4. Error Handling Architecture
 
 ### Layered Error Handling
@@ -623,6 +671,93 @@ impl SomaFMPlugin for LastFmPlugin {
     }
 }
 ```
+
+### Exercise 5: Optimize Streaming Performance
+**Goal**: Enhance the continuous streaming implementation for better performance and reliability.
+
+**Task**: Add adaptive streaming with quality control:
+
+```rust
+// From src/audio.rs - Enhanced streaming configuration
+#[derive(Debug, Clone)]
+pub struct StreamingConfig {
+    pub initial_buffer_size: usize,    // Start small for fast playback
+    pub max_buffer_size: usize,        // Prevent memory bloat
+    pub chunk_size: usize,             // Optimal decode chunk size
+    pub quality_threshold: f32,        // Minimum quality for playback
+    pub retry_attempts: u32,           // Network error handling
+    pub adaptive_sizing: bool,         // Adjust sizes based on network
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            initial_buffer_size: 32 * 1024,   // 32KB for quick start
+            max_buffer_size: 512 * 1024,      // 512KB max memory
+            chunk_size: 64 * 1024,            // 64KB decode chunks
+            quality_threshold: 0.8,           // 80% quality minimum
+            retry_attempts: 3,                // 3 network retries
+            adaptive_sizing: true,            // Enable adaptation
+        }
+    }
+}
+
+async fn adaptive_fetch_and_play_stream(
+    url: &str,
+    config: StreamingConfig,
+    sink: &Arc<Mutex<Option<Sink>>>,
+) -> Result<()> {
+    let mut current_chunk_size = config.chunk_size;
+    let mut network_quality = 1.0f32;
+    let mut consecutive_errors = 0u32;
+    
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(data) => {
+                // Adapt chunk size based on network performance
+                if config.adaptive_sizing {
+                    current_chunk_size = adapt_chunk_size(
+                        current_chunk_size, 
+                        network_quality,
+                        &config
+                    );
+                }
+                
+                // Process with current settings
+                process_audio_chunk(data, current_chunk_size, sink).await?;
+                consecutive_errors = 0;
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors > config.retry_attempts {
+                    return Err(e.into());
+                }
+                
+                // Exponential backoff
+                tokio::time::sleep(Duration::from_millis(
+                    100 * 2u64.pow(consecutive_errors)
+                )).await;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn adapt_chunk_size(current: usize, quality: f32, config: &StreamingConfig) -> usize {
+    // TODO: Implement adaptive sizing logic
+    // - Increase chunk size for stable connections
+    // - Decrease for poor network conditions
+    // - Respect min/max bounds
+    current
+}
+```
+
+**Additional Challenges**:
+1. Add network quality measurement based on download speeds
+2. Implement codec-specific optimization (MP3 vs AAC frame boundaries)
+3. Add prefetching for seamless station switching
+4. Create metrics collection for streaming performance analysis
 
 ## Architecture Principles Summary
 

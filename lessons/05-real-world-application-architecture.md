@@ -213,9 +213,9 @@ async fn fetch_and_play_stream(
         Self::fetch_network_stream(url, audio_tx, cancellation_token, event_sender).await
     });
 
-    // Main decoding loop with smart buffering
+    // Main decoding loop with smart buffering and throttling
     let mut decode_buffer = VecDeque::new();
-    const MIN_DECODE_SIZE: usize = 64 * 1024;  // 🔑 Accumulate before decode
+    const MIN_DECODE_SIZE: usize = 128 * 1024; // 🔑 Increased to 128KB for better decode success
     const MAX_BUFFER_SIZE: usize = 512 * 1024; // 🔑 Prevent unbounded growth
 
     loop {
@@ -225,9 +225,16 @@ async fn fetch_and_play_stream(
                     Some(chunk) => {
                         decode_buffer.extend(chunk);
                         
-                        // Smart memory management
+                        // Smart memory management with decode throttling
                         if decode_buffer.len() >= MIN_DECODE_SIZE {
-                            Self::try_decode_and_play(&mut decode_buffer, state).await?;
+                            // Decode throttling: Only attempt decode every few chunks to reduce CPU overhead
+                            static mut DECODE_COUNTER: u32 = 0;
+                            unsafe {
+                                DECODE_COUNTER += 1;
+                                if DECODE_COUNTER % 5 == 0 { // 🔑 Decode every 5th chunk
+                                    Self::try_decode_and_play(&mut decode_buffer, state).await?;
+                                }
+                            }
                         }
                         
                         // Prevent memory leaks
@@ -282,9 +289,10 @@ async fn fetch_network_stream(
 3. **Backpressure**: Network automatically slows when decoder can't keep up
 4. **Proper Cancellation**: `CancellationToken` allows clean task termination
 5. **Smart Memory Management**: Accumulate data before decode attempts, drop old data when needed
-6. **Event Broadcasting**: `watch::Sender` allows UI to react to streaming events
+6. **Decode Throttling**: Process every 5th chunk to reduce CPU overhead while maintaining audio quality
+7. **Event Broadcasting**: `watch::Sender` allows UI to react to streaming events
 
-**Why This Architecture**: Traditional approaches either block on network or decode failures. This design provides continuous playback with predictable memory usage and proper error boundaries.
+**Why This Architecture**: Traditional approaches either block on network or decode failures. This design provides continuous playback with predictable memory usage, optimized CPU utilization, and proper error boundaries.
 
 ## 4. Error Handling Architecture
 

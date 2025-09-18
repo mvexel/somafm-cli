@@ -1,33 +1,220 @@
 use anyhow::Result;
 use log::{debug, warn};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
-use std::io::Cursor;
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use futures_util::stream::StreamExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use std::collections::VecDeque;
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::codecs::DecoderOptions;
+// use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::audio::Signal;
+use symphonia::default::{get_codecs, get_probe};
 
-/// Helper function to log memory usage for monitoring
-fn log_memory_usage(buffer_size: usize, operation: &str) {
-    let kb = buffer_size as f64 / 1024.0;
-    let mb = kb / 1024.0;
-    if mb >= 1.0 {
-        debug!("{}: Using {:.1} MB ({:.0} KB) of memory", operation, mb, kb);
-    } else {
-        debug!("{}: Using {:.0} KB of memory", operation, kb);
+/// A wrapper so we can feed network chunks into Symphonia
+struct StreamingSource {
+    buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    pos: Arc<Mutex<usize>>,
+}
+
+impl StreamingSource {
+    fn new() -> (Self, Arc<tokio::sync::Mutex<Vec<u8>>>, Arc<Mutex<usize>>) {
+        let buffer = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let pos = Arc::new(Mutex::new(0));
+        let source = Self {
+            buffer: buffer.clone(),
+            pos: pos.clone(),
+        };
+        (source, buffer, pos)
     }
 }
 
+impl Read for StreamingSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Use try_lock to avoid blocking since Read trait is synchronous
+        let buffer = self.buffer.try_lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "buffer locked")
+        })?;
+
+        let mut pos = self.pos.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "failed to lock position")
+        })?;
+
+        if *pos >= buffer.len() {
+            return Ok(0); // no new data yet
+        }
+
+        let n = std::cmp::min(buf.len(), buffer.len() - *pos);
+        buf[..n].copy_from_slice(&buffer[*pos..*pos + n]);
+        *pos += n;
+
+        // Note: Buffer cleanup is now handled entirely by the network task
+        // This read function only advances position
+
+        Ok(n)
+    }
+}
+
+impl Seek for StreamingSource {
+    fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "seek not supported"))
+    }
+}
+
+impl MediaSource for StreamingSource {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Custom rodio Source that streams directly from Symphonia AudioBufferRef
+/// Avoids per-packet Vec<f32> allocations for better performance
+pub struct SymphoniaStreamSource {
+    samples: std::collections::VecDeque<f32>,
+    sample_rate: u32,
+    channels: u16,
+    finished: bool,
+}
+
+impl SymphoniaStreamSource {
+    fn new(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            sample_rate,
+            channels,
+            finished: false,
+        }
+    }
+
+    /// Push samples directly from AudioBufferRef without intermediate Vec allocation
+    fn push_audio_buffer(&mut self, audio_buf: &symphonia::core::audio::AudioBufferRef) {
+        let spec = *audio_buf.spec();
+        let chans = spec.channels.count();
+        let frames = audio_buf.frames();
+
+        // Direct conversion without intermediate Vec allocation
+        match audio_buf {
+            symphonia::core::audio::AudioBufferRef::F32(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        self.samples.push_back(plane[frame]);
+                    }
+                }
+            }
+            symphonia::core::audio::AudioBufferRef::F64(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        self.samples.push_back(plane[frame] as f32);
+                    }
+                }
+            }
+            symphonia::core::audio::AudioBufferRef::S16(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        self.samples.push_back(plane[frame] as f32 / i16::MAX as f32);
+                    }
+                }
+            }
+            symphonia::core::audio::AudioBufferRef::S32(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        self.samples.push_back(plane[frame] as f32 / i32::MAX as f32);
+                    }
+                }
+            }
+            symphonia::core::audio::AudioBufferRef::U8(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        let sample = (plane[frame] as i16 - 128) as f32 / 128.0;
+                        self.samples.push_back(sample);
+                    }
+                }
+            }
+            symphonia::core::audio::AudioBufferRef::U24(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        let u24_bytes = plane[frame].to_ne_bytes();
+                        let u24_val = u32::from_ne_bytes([u24_bytes[0], u24_bytes[1], u24_bytes[2], 0]);
+                        let sample = (u24_val as i32 - 0x800000) as f32 / 0x800000 as f32;
+                        self.samples.push_back(sample);
+                    }
+                }
+            }
+            symphonia::core::audio::AudioBufferRef::U32(buf) => {
+                for frame in 0..frames {
+                    for ch in 0..chans {
+                        let plane = buf.chan(ch);
+                        let sample = (plane[frame] as i64 - 0x80000000i64) as f32 / 0x80000000i64 as f32;
+                        self.samples.push_back(sample);
+                    }
+                }
+            }
+            _ => {
+                debug!("Unsupported audio format in streaming source");
+            }
+        }
+    }
+
+    fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+
+    fn has_data(&self) -> bool {
+        !self.samples.is_empty() || !self.finished
+    }
+}
+
+impl Iterator for SymphoniaStreamSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.samples.pop_front()
+    }
+}
+
+impl Source for SymphoniaStreamSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
-    Started(String),
+    Connecting(String),    // Starting connection to URL
+    Connected,             // Successfully connected and decoding started
     Stopped,
     Paused,
     Resumed,
     Error(String),
-    StreamConnected,
     BufferProgress(usize), // bytes buffered
+    Metadata(String),      // ICY metadata (track titles, etc.)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,7 +360,7 @@ impl SimpleAudioPlayer {
         }
 
         // Send connecting event
-        let _ = self.event_sender.send(PlayerEvent::Started(url.clone()));
+        let _ = self.event_sender.send(PlayerEvent::Connecting(url.clone()));
 
         // Spawn the streaming task
         let state_clone = self.state.clone();
@@ -343,7 +530,7 @@ impl SimpleAudioPlayer {
         Ok(())
     }
 
-    /// Improved streaming with bounded buffering and backpressure handling
+    /// Improved streaming with Symphonia continuous decoding
     async fn fetch_and_play_stream(
         url: &str,
         stream_handle: &OutputStreamHandle,
@@ -351,79 +538,190 @@ impl SimpleAudioPlayer {
         event_sender: &watch::Sender<PlayerEvent>,
         cancellation_token: &CancellationToken,
     ) -> Result<()> {
-        debug!("Fetching stream from URL: {}", url);
-
-        // Create bounded channel for audio chunks
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32); // Buffer up to 32 chunks
+        debug!("Fetching stream from URL (symphonia): {}", url);
 
         // Create sink for this stream
-        let sink = Sink::try_new(stream_handle)?;
+        let new_sink = Sink::try_new(stream_handle)?;
 
         // Update state with the new sink
         {
             let mut state_guard = state.lock().map_err(|_| anyhow::anyhow!("Failed to acquire state lock"))?;
-            state_guard.sink = Some(sink);
+            state_guard.sink = Some(new_sink);
             state_guard.set_state(PlaybackState::Playing);
         }
 
-        let _ = event_sender.send(PlayerEvent::StreamConnected);
+        let _ = event_sender.send(PlayerEvent::Connected);
 
-        // Spawn network fetching task
-        let url_clone = url.to_string();
-        let cancellation_clone = cancellation_token.clone();
-        let event_sender_clone = event_sender.clone();
-        
-        let fetch_task = tokio::spawn(async move {
-            Self::fetch_network_stream(url_clone, audio_tx, cancellation_clone, event_sender_clone).await
-        });
+        // Create HTTP client with proper settings for streaming
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?;
 
-        // Main decoding and playback loop
-        let mut decode_buffer = VecDeque::new();
-        let mut total_bytes = 0usize;
-        const MIN_DECODE_SIZE: usize = 128 * 1024; // 128KB minimum before attempting decode (increased to reduce frequent decodes)
-        const MAX_BUFFER_SIZE: usize = 512 * 1024; // 512KB maximum buffer
+        let response = client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+        }
 
-        loop {
-            tokio::select! {
-                // Receive audio data from network
-                chunk_opt = audio_rx.recv() => {
-                    match chunk_opt {
-                        Some(chunk) => {
-                            total_bytes += chunk.len();
-                            decode_buffer.extend(chunk);
-                            
-                            log_memory_usage(decode_buffer.len(), "Audio buffer");
-                            let _ = event_sender.send(PlayerEvent::BufferProgress(decode_buffer.len()));
+        // Shared buffer for new data
+        let (media_source, shared_buf, read_pos) = StreamingSource::new();
 
-                            // Try to decode when we have enough data and less frequently
-                            if decode_buffer.len() >= MIN_DECODE_SIZE {
-                                // Only attempt decode every few chunks to reduce overhead
-                                static mut DECODE_COUNTER: u32 = 0;
-                                unsafe {
-                                    DECODE_COUNTER += 1;
-                                    if DECODE_COUNTER % 5 == 0 { // Decode every 5th chunk
-                                        if let Err(e) = Self::try_decode_and_play(&mut decode_buffer, state).await {
-                                            debug!("Decode attempt failed: {}", e);
+        // Spawn a task that keeps filling the buffer with network bytes
+        {
+            let shared_buf = shared_buf.clone();
+            let read_pos = read_pos.clone();
+            let cancellation_token = cancellation_token.clone();
+            let event_sender_clone = event_sender.clone();
+            tokio::spawn(async move {
+                let mut stream = response.bytes_stream();
+                let mut total_bytes = 0usize;
+                const MAX_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer limit
+                const BACKPRESSURE_THRESHOLD: usize = 6 * 1024 * 1024; // Start backpressure at 6MB
+                const CLEANUP_THRESHOLD: usize = 2 * 1024 * 1024; // Clean up after 2MB read
+
+                while let Some(chunk_result) = stream.next().await {
+                    // Tighter cancellation check with select
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            debug!("Network fetch cancelled");
+                            break;
+                        }
+                        chunk_result = async { chunk_result } => {
+                            if let Ok(chunk) = chunk_result {
+                                total_bytes += chunk.len();
+
+                                // Consolidated buffer management based on read position
+                                loop {
+                                    let (buffer_size, cleanup_needed) = {
+                                        let buf = shared_buf.lock().await;
+                                        let pos = read_pos.lock().unwrap();
+                                        (buf.len(), *pos > CLEANUP_THRESHOLD)
+                                    };
+
+                                    if cleanup_needed {
+                                        // Clean up read data to prevent unbounded growth
+                                        let mut buf = shared_buf.lock().await;
+                                        let mut pos = read_pos.lock().unwrap();
+                                        if *pos > 0 {
+                                            buf.drain(..*pos);
+                                            debug!("Cleaned up {}KB of read data", *pos / 1024);
+                                            *pos = 0;
                                         }
+                                    } else if buffer_size > MAX_BUFFER_SIZE {
+                                        // Emergency cleanup if buffer gets too large despite position tracking
+                                        let mut buf = shared_buf.lock().await;
+                                        let drop_size = buf.len() / 4;
+                                        buf.drain(..drop_size);
+                                        debug!("Emergency cleanup: dropped {}KB of old data", drop_size / 1024);
+
+                                        // Reset read position since we dropped data
+                                        let mut pos = read_pos.lock().unwrap();
+                                        *pos = (*pos).saturating_sub(drop_size);
+                                    } else if buffer_size > BACKPRESSURE_THRESHOLD {
+                                        // Apply backpressure by waiting briefly
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+                                            _ = cancellation_token.cancelled() => return,
+                                        }
+                                    } else {
+                                        break; // Buffer size is acceptable
                                     }
                                 }
-                            }
 
-                            // Prevent buffer from growing too large
-                            if decode_buffer.len() > MAX_BUFFER_SIZE {
-                                warn!("Audio buffer too large ({}KB), dropping old data", decode_buffer.len() / 1024);
-                                // Drop the first quarter of the buffer
-                                let drop_size = decode_buffer.len() / 4;
-                                decode_buffer.drain(..drop_size);
+                                // Add new data to buffer
+                                {
+                                    let mut buf = shared_buf.lock().await;
+                                    buf.extend_from_slice(&chunk);
+
+                                    // Emit buffer progress periodically
+                                    if total_bytes % (256 * 1024) == 0 { // Every 256KB
+                                        let _ = event_sender_clone.send(PlayerEvent::BufferProgress(buf.len()));
+                                    }
+                                }
+
+                                // Log progress periodically
+                                if total_bytes % (512 * 1024) == 0 && total_bytes > 0 {
+                                    debug!("Network fetched {} KB so far", total_bytes / 1024);
+                                }
+                            }
+                        }
+                    }
+                }
+                debug!("Network stream ended, total bytes: {}KB", total_bytes / 1024);
+            });
+        }
+
+        // Wait for some initial data before trying to decode
+        while {
+            let buf = shared_buf.lock().await;
+            buf.len() < 64 * 1024 // Wait for 64KB before starting
+        } && !cancellation_token.is_cancelled() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+
+        // Attach symphonia to our streaming source
+        let mss = MediaSourceStream::new(
+            Box::new(media_source) as Box<dyn MediaSource>,
+            MediaSourceStreamOptions::default(),
+        );
+
+        let hint = Hint::new(); // can set extension if known
+        let probed = get_probe().format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )?;
+
+        let mut format = probed.format;
+
+        let track = format
+            .default_track()
+            .ok_or_else(|| anyhow::anyhow!("no default track"))?;
+
+        let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+
+        debug!("Found audio track: codec={:?}, sample_rate={:?}, channels={:?}",
+            track.codec_params.codec,
+            track.codec_params.sample_rate,
+            track.codec_params.channels
+        );
+
+        // Create channel for sending decoded audio samples to sink
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<rodio::buffer::SamplesBuffer<f32>>(16);
+
+        // Spawn blocking task for CPU-heavy decoding
+        let decode_task = {
+            let cancellation_token = cancellation_token.clone();
+            tokio::task::spawn_blocking(move || {
+                Self::decode_blocking_task(format, decoder, audio_tx, cancellation_token)
+            })
+        };
+
+        // Main async task handles sink management
+        loop {
+            tokio::select! {
+                // Receive decoded audio from blocking task
+                audio_source = audio_rx.recv() => {
+                    match audio_source {
+                        Some(source) => {
+                            if let Ok(state_guard) = state.lock() {
+                                if let Some(current_sink) = state_guard.sink.as_ref() {
+                                    current_sink.append(source);
+                                    current_sink.play();
+                                }
                             }
                         }
                         None => {
-                            debug!("Network stream ended");
+                            debug!("Decode task ended");
                             break;
                         }
                     }
                 }
-                
+
                 // Check for cancellation
                 _ = cancellation_token.cancelled() => {
                     debug!("Stream playback cancelled");
@@ -432,115 +730,173 @@ impl SimpleAudioPlayer {
             }
         }
 
-        // Wait for fetch task to complete
-        let _ = fetch_task.await;
+        // Wait for decode task to complete
+        let _ = decode_task.await;
 
-        debug!("Stream playback ended, total bytes: {}KB", total_bytes / 1024);
         Ok(())
     }
 
-    /// Network fetching task with backpressure handling
-    async fn fetch_network_stream(
-        url: String,
-        audio_tx: mpsc::Sender<Vec<u8>>,
+    /// CPU-heavy blocking task for Symphonia decoding
+    fn decode_blocking_task(
+        mut format: Box<dyn FormatReader>,
+        mut decoder: Box<dyn symphonia::core::codecs::Decoder>,
+        audio_tx: tokio::sync::mpsc::Sender<rodio::buffer::SamplesBuffer<f32>>,
         cancellation_token: CancellationToken,
-        _event_sender: watch::Sender<PlayerEvent>,
     ) -> Result<()> {
-        // Create HTTP client with proper settings for streaming
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()?;
+        let mut consecutive_errors = 0;
+        let mut backoff_delay = std::time::Duration::from_millis(10);
+        const MAX_CONSECUTIVE_ERRORS: u32 = 15;
+        const MAX_BACKOFF_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-        let response = client.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
-        }
-
-        debug!("Connected to network stream");
-        let mut stream = response.bytes_stream();
-        let mut total_bytes = 0usize;
-
-        while let Some(chunk_result) = stream.next().await {
-            // Check for cancellation
+        loop {
+            // Check for cancellation (this is a blocking task, so check periodically)
             if cancellation_token.is_cancelled() {
-                debug!("Network fetch cancelled");
+                debug!("Decode task cancelled");
                 break;
             }
 
-            let chunk = chunk_result?;
-            total_bytes += chunk.len();
+            match format.next_packet() {
+                Ok(packet) => {
+                    consecutive_errors = 0;
+                    backoff_delay = std::time::Duration::from_millis(10);
 
-            // Send chunk with backpressure handling
-            match audio_tx.try_send(chunk.to_vec()) {
-                Ok(_) => {
-                    // Successfully sent
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Channel is full, apply backpressure by waiting a shorter time
-                    debug!("Audio buffer full, applying backpressure");
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
-                        _ = cancellation_token.cancelled() => break,
-                    }
-                    // Try again after waiting
-                    if let Err(e) = audio_tx.send(chunk.to_vec()).await {
-                        warn!("Failed to send audio chunk after backpressure: {}", e);
-                        break;
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!("Audio channel closed");
-                    break;
-                }
-            }
+                    match decoder.decode(&packet) {
+                        Ok(audio_buf) => {
+                            // Convert to rodio samples (f32 PCM)
+                            let spec = *audio_buf.spec();
+                            let chans = spec.channels.count();
+                            let frames = audio_buf.frames();
 
-            // Log progress periodically
-            if total_bytes % (512 * 1024) == 0 && total_bytes > 0 {
-                debug!("Network fetched {} KB so far", total_bytes / 1024);
-            }
-        }
+                            let mut samples = Vec::with_capacity(frames * chans);
 
-        debug!("Network stream fetch completed, total bytes: {}KB", total_bytes / 1024);
-        Ok(())
-    }
+                            // Extract samples based on the format and interleave properly
+                            match audio_buf {
+                                symphonia::core::audio::AudioBufferRef::F32(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            samples.push(plane[frame]);
+                                        }
+                                    }
+                                }
+                                symphonia::core::audio::AudioBufferRef::F64(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            samples.push(plane[frame] as f32);
+                                        }
+                                    }
+                                }
+                                symphonia::core::audio::AudioBufferRef::S16(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            samples.push(plane[frame] as f32 / i16::MAX as f32);
+                                        }
+                                    }
+                                }
+                                symphonia::core::audio::AudioBufferRef::S32(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            samples.push(plane[frame] as f32 / i32::MAX as f32);
+                                        }
+                                    }
+                                }
+                                symphonia::core::audio::AudioBufferRef::U8(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            let sample = (plane[frame] as i16 - 128) as f32 / 128.0;
+                                            samples.push(sample);
+                                        }
+                                    }
+                                }
+                                symphonia::core::audio::AudioBufferRef::U24(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            let u24_bytes = plane[frame].to_ne_bytes();
+                                            let u24_val = u32::from_ne_bytes([u24_bytes[0], u24_bytes[1], u24_bytes[2], 0]);
+                                            let sample = (u24_val as i32 - 0x800000) as f32 / 0x800000 as f32;
+                                            samples.push(sample);
+                                        }
+                                    }
+                                }
+                                symphonia::core::audio::AudioBufferRef::U32(buf) => {
+                                    for frame in 0..frames {
+                                        for ch in 0..chans {
+                                            let plane = buf.chan(ch);
+                                            let sample = (plane[frame] as i64 - 0x80000000i64) as f32 / 0x80000000i64 as f32;
+                                            samples.push(sample);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    debug!("Unsupported audio format in packet, skipping");
+                                    continue;
+                                }
+                            }
 
-    /// Try to decode accumulated buffer and add to sink
-    async fn try_decode_and_play(
-        decode_buffer: &mut VecDeque<u8>,
-        state: &Arc<Mutex<PlayerState>>,
-    ) -> Result<()> {
-        // Convert buffer to Vec for cursor - we need to own the data
-        let buffer_vec: Vec<u8> = decode_buffer.iter().copied().collect();
-        let cursor = Cursor::new(buffer_vec);
+                            // Create rodio source and send to async task
+                            let source = rodio::buffer::SamplesBuffer::new(
+                                chans as u16,
+                                spec.rate,
+                                samples,
+                            );
 
-        match Decoder::new(cursor) {
-            Ok(source) => {
-                debug!("Successfully decoded {} bytes", decode_buffer.len());
-
-                // Add to sink
-                if let Ok(state_guard) = state.lock() {
-                    if let Some(sink) = state_guard.sink.as_ref() {
-                        sink.append(source);
-
-                        // Start playback if not already playing
-                        if !sink.is_paused() {
-                            sink.play();
+                            // Send to async task (non-blocking)
+                            if audio_tx.try_send(source).is_err() {
+                                // Channel full or closed, decoder is faster than playback
+                                debug!("Audio channel full, decoder waiting");
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                        }
+                        Err(symphonia::core::errors::Error::DecodeError(_)) => {
+                            // Non-fatal, skip bad frame
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Decoder error: {}", e);
+                            break;
                         }
                     }
                 }
+                Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    consecutive_errors += 1;
 
-                // Clear the buffer after successful decode
-                decode_buffer.clear();
-                Ok(())
-            }
-            Err(e) => {
-                // If decode fails with insufficient data, keep the buffer
-                // If it's a real error, we might want to drop some data
-                Err(anyhow::anyhow!("Decode failed: {}", e))
+                    if consecutive_errors > MAX_CONSECUTIVE_ERRORS {
+                        debug!("Too many consecutive EOF errors, applying backoff");
+
+                        std::thread::sleep(backoff_delay);
+
+                        // Exponential backoff with jitter
+                        let jitter = std::time::Duration::from_millis((consecutive_errors % 10) as u64);
+                        backoff_delay = std::cmp::min(
+                            backoff_delay * 2 + jitter,
+                            MAX_BACKOFF_DELAY
+                        );
+                        consecutive_errors = 0;
+                    } else {
+                        // Brief yield
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                Err(symphonia::core::errors::Error::ResetRequired) => {
+                    warn!("Decoder reset required (unsupported)");
+                    break;
+                }
+                Err(e) => {
+                    debug!("Format error: {}", e);
+                    break;
+                }
             }
         }
+
+        debug!("Decode blocking task ended");
+        Ok(())
     }
+
 }
 
 async fn resolve_stream_url(url: &str) -> Result<String> {
